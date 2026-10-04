@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Steganography Tool</title>
+<style>
+body{margin:0;font-family:system-ui;background:#eef3f1;color:#152126}
+main{max-width:1100px;margin:auto;padding:28px}
+h1{font-size:clamp(2rem,6vw,4rem);margin:0 0 8px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.card{background:white;border:1px solid #ccd8d5;border-radius:8px;padding:18px;box-shadow:0 12px 32px #0001}
+label{display:grid;gap:6px;margin:12px 0;font-weight:700;color:#52636a}
+input,textarea,button{font:inherit;border:1px solid #ccd8d5;border-radius:6px;padding:10px}
+textarea{resize:vertical}
+button{background:#176f5d;color:white;font-weight:800;cursor:pointer}
+button.secondary{background:white;color:#176f5d}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+pre{white-space:pre-wrap;background:#f3f7f6;border:1px solid #ccd8d5;border-radius:6px;padding:10px;min-height:70px}
+canvas{width:100%;height:180px;border:1px solid #ccd8d5;border-radius:6px;object-fit:contain}
+.err{color:#a33a34}.ok{color:#176d41}
+@media(max-width:850px){.grid,.row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+<h1>Steganography Tool</h1>
+<p>Hide encrypted, compressed text inside an image and unlock it later with a passphrase. Output is always lossless PNG so the hidden bits survive.</p>
+
+<div class="grid">
+<section class="card">
+<h2>Hide message</h2>
+<input id="cover" type="file" accept=".png,.bmp,.tif,.tiff,.webp,.jpg,.jpeg,image/*">
+<canvas id="coverCanvas"></canvas>
+<label>Message<textarea id="msg" rows="7"></textarea></label>
+<label>Passphrase<input id="pass1" type="password"></label>
+<div class="row">
+<label>LSB depth<input id="lsb1" type="number" min="1" max="4" value="1"></label>
+<label><span>Use alpha channel</span><input id="alpha1" type="checkbox"></label>
+</div>
+<div class="row">
+<button class="secondary" id="capacityBtn">Check capacity</button>
+<button id="embedBtn">Create PNG</button>
+</div>
+<pre id="embedOut"></pre>
+</section>
+
+<section class="card">
+<h2>Extract message</h2>
+<input id="stego" type="file" accept=".png,.bmp,.tif,.tiff,.webp,.jpg,.jpeg,image/*">
+<canvas id="stegoCanvas"></canvas>
+<label>Passphrase<input id="pass2" type="password"></label>
+<div class="row">
+<label>LSB depth<input id="lsb2" type="number" min="1" max="4" value="1"></label>
+<label><span>Use alpha channel</span><input id="alpha2" type="checkbox"></label>
+</div>
+<button id="extractBtn">Unlock message</button>
+<label>Recovered message<textarea id="recovered" rows="8" readonly></textarea></label>
+<pre id="extractOut"></pre>
+</section>
+</div>
+</main>
+
+<script>
+const MAGIC="STEGOWEBv1!";
+const MARKER="fixed-marker:stego-web-tool:v1";
+const HEADER=28,SALT=16,NONCE=12,TAG=32,ROUNDS=250000;
+const enc=new TextEncoder(),dec=new TextDecoder();
+let coverImg=null,stegoImg=null;
+
+class StegoError extends Error{}
+const $=id=>document.getElementById(id);
+const ok=(el,t)=>{el.className="ok";el.textContent=t};
+const err=(el,t)=>{el.className="err";el.textContent=t};
+const fmt=n=>n<1024?n+" B":n<1048576?(n/1024).toFixed(1)+" KB":(n/1048576).toFixed(2)+" MB";
+
+function lsb(v){v=Number(v);if(v<1||v>4)throw new StegoError("LSB depth must be 1 to 4.");return v}
+function channels(a){return a?4:3}
+function capacity(img,bits,a){return Math.max(0,Math.floor(img.w*img.h*channels(a)*bits/8)-HEADER)}
+function concat(parts){let n=parts.reduce((s,p)=>s+p.length,0),o=new Uint8Array(n),i=0;for(const p of parts){o.set(p,i);i+=p.length}return o}
+function equal(a,b){if(a.length!==b.length)return false;let d=0;for(let i=0;i<a.length;i++)d|=a[i]^b[i];return d===0}
+
+async function load(file,canvas){
+ if(!file)throw new StegoError("Choose an image first.");
+ if(file.size>32*1024*1024)throw new StegoError("Image is too large. Use one under 32 MB.");
+ if(!/\.(png|bmp|tiff?|webp|jpe?g)$/i.test(file.name))throw new StegoError("Unsupported format.");
+ const url=URL.createObjectURL(file);
+ try{
+  const im=new Image(); im.src=url; await im.decode();
+  canvas.width=im.naturalWidth; canvas.height=im.naturalHeight;
+  const ctx=canvas.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(im,0,0);
+  return {w:canvas.width,h:canvas.height,canvas,data:ctx.getImageData(0,0,canvas.width,canvas.height)};
+ }catch(e){
+  if(/\.tiff?$/i.test(file.name))throw new StegoError("This browser cannot decode TIFF. Convert it to PNG first.");
+  throw new StegoError("Image could not be opened or is corrupted.");
+ }finally{URL.revokeObjectURL(url)}
+}
+
+async function compress(bytes){
+ if(!window.CompressionStream)throw new StegoError("This browser lacks zlib CompressionStream. Use current Chrome or Edge.");
+ return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"))).arrayBuffer());
+}
+async function decompress(bytes){
+ try{return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer())}
+ catch{throw new StegoError("Payload decompression failed. Data may be corrupted.")}
+}
+async function keys(pass,salt){
+ if(!pass)throw new StegoError("Passphrase required.");
+ const base=await crypto.subtle.importKey("raw",enc.encode(pass),"PBKDF2",false,["deriveBits"]);
+ const bits=new Uint8Array(await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:ROUNDS,hash:"SHA-256"},base,512));
+ return {
+  aes:await crypto.subtle.importKey("raw",bits.slice(0,32),"AES-GCM",false,["encrypt","decrypt"]),
+  hmac:await crypto.subtle.importKey("raw",bits.slice(32),{name:"HMAC",hash:"SHA-256"},false,["sign"])
+ };
+}
+async function marker(hmac){return new Uint8Array(await crypto.subtle.sign("HMAC",hmac,enc.encode(MARKER)))}
+
+async function payload(message,pass){
+ if(!message.trim())throw new StegoError("Message required.");
+ const plain=enc.encode(message), comp=await compress(plain);
+ const salt=crypto.getRandomValues(new Uint8Array(SALT));
+ const nonce=crypto.getRandomValues(new Uint8Array(NONCE));
+ const k=await keys(pass,salt), tag=await marker(k.hmac);
+ const aad=concat([enc.encode(MAGIC),tag]);
+ const cipher=new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM",iv:nonce,additionalData:aad},k.aes,comp));
+ const body=SALT+NONCE+TAG+cipher.length, out=new Uint8Array(HEADER+body), v=new DataView(out.buffer);
+ out.set(enc.encode(MAGIC),0); v.setUint8(12,1); v.setUint8(13,1); v.setUint32(16,plain.length,false); v.setUint32(20,body,false); v.setUint32(24,comp.length,false);
+ let o=HEADER; out.set(salt,o); o+=SALT; out.set(nonce,o); o+=NONCE; out.set(tag,o); o+=TAG; out.set(cipher,o);
+ return {out,plain:plain.length,comp:comp.length};
+}
+async function parse(bytes,pass){
+ if(dec.decode(bytes.slice(0,11))!==MAGIC)throw new StegoError("Missing fixed marker. No compatible payload found.");
+ const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength), body=v.getUint32(20,false), plainLen=v.getUint32(16,false);
+ let o=HEADER,salt=bytes.slice(o,o+SALT); o+=SALT; let nonce=bytes.slice(o,o+NONCE); o+=NONCE; let tag=bytes.slice(o,o+TAG); o+=TAG;
+ const cipher=bytes.slice(o,HEADER+body), k=await keys(pass,salt), expected=await marker(k.hmac);
+ if(!equal(tag,expected))throw new StegoError("Wrong passphrase, corrupted payload, tampered marker, or missing data.");
+ let comp;
+ try{comp=new Uint8Array(await crypto.subtle.decrypt({name:"AES-GCM",iv:nonce,additionalData:concat([enc.encode(MAGIC),tag])},k.aes,cipher))}
+ catch{throw new StegoError("Wrong passphrase or integrity check failed.")}
+ const plain=await decompress(comp);
+ if(plain.length!==plainLen)throw new StegoError("Payload size check failed.");
+ return dec.decode(plain);
+}
+function chunks(bytes,bits){let a=[],buf=0,n=0,m=(1<<bits)-1;for(const b of bytes){buf=(buf<<8)|b;n+=8;while(n>=bits){let s=n-bits;a.push((buf>>s)&m);buf=s?buf&((1<<s)-1):0;n-=bits}}if(n)a.push((buf<<(bits-n))&m);return a}
+function unchunks(ch,need,bits){let out=new Uint8Array(need),oi=0,buf=0,n=0;for(const c of ch){buf=(buf<<bits)|c;n+=bits;while(n>=8&&oi<need){let s=n-8;out[oi++]=(buf>>s)&255;buf=s?buf&((1<<s)-1):0;n-=8}if(oi>=need)break}if(oi!==need)throw new StegoError("Image ended before payload was fully read.");return out}
+function embed(img,bytes,bits,a){
+ if(bytes.length>capacity(img,bits,a)+HEADER)throw new StegoError("Message too large for this image.");
+ const out=new ImageData(new Uint8ClampedArray(img.data.data),img.w,img.h), data=out.data, ch=a?[0,1,2,3]:[0,1,2], cs=chunks(bytes,bits), m=(1<<bits)-1, clear=255^m; let i=0;
+ for(let p=0;p<data.length&&i<cs.length;p+=4)for(const c of ch){data[p+c]=(data[p+c]&clear)|cs[i++];if(i>=cs.length)break}
+ return out;
+}
+function read(img,need,bits,a){const data=img.data.data,ch=a?[0,1,2,3]:[0,1,2],m=(1<<bits)-1,needChunks=Math.ceil(need*8/bits),cs=[];for(let p=0;p<data.length&&cs.length<needChunks;p+=4)for(const c of ch){cs.push(data[p+c]&m);if(cs.length>=needChunks)break}return unchunks(cs,need,bits)}
+function readPayload(img,bits,a){const h=read(img,HEADER,bits,a);if(dec.decode(h.slice(0,11))!==MAGIC)throw new StegoError("Missing marker. Check image, LSB depth, and alpha option.");const body=new DataView(h.buffer).getUint32(20,false);if(body<TAG+SALT+NONCE||HEADER+body>capacity(img,bits,a)+HEADER)throw new StegoError("Payload length marker is corrupted.");return read(img,HEADER+body,bits,a)}
+function download(imageData){const c=document.createElement("canvas");c.width=imageData.width;c.height=imageData.height;c.getContext("2d").putImageData(imageData,0,0);c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="stego-message.png";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),3000)},"image/png")}
+
+$("cover").onchange=async()=>{try{coverImg=await load($("cover").files[0],$("coverCanvas"));ok($("embedOut"),"Cover loaded. Capacity: "+fmt(capacity(coverImg,lsb($("lsb1").value),$("alpha1").checked)))}catch(e){err($("embedOut"),e.message)}};
+$("stego").onchange=async()=>{try{stegoImg=await load($("stego").files[0],$("stegoCanvas"));ok($("extractOut"),"Stego image loaded.")}catch(e){err($("extractOut"),e.message)}};
+$("capacityBtn").onclick=()=>{try{if(!coverImg)throw new StegoError("Choose a cover image first.");ok($("embedOut"),"Capacity: "+fmt(capacity(coverImg,lsb($("lsb1").value),$("alpha1").checked))+"\nCurrent message before compression: "+fmt(enc.encode($("msg").value).length))}catch(e){err($("embedOut"),e.message)}};
+$("embedBtn").onclick=async()=>{try{if(!coverImg)throw new StegoError("Choose a cover image first.");const bits=lsb($("lsb1").value), p=await payload($("msg").value,$("pass1").value), out=embed(coverImg,p.out,bits,$("alpha1").checked);download(out);ok($("embedOut"),`Stego PNG created.\nPayload: ${fmt(p.out.length)}\nPlaintext: ${fmt(p.plain)}\nCompressed: ${fmt(p.comp)}\nCapacity: ${fmt(capacity(coverImg,bits,$("alpha1").checked))}`)}catch(e){err($("embedOut"),e.message)}};
+$("extractBtn").onclick=async()=>{try{if(!stegoImg)throw new StegoError("Choose a stego image first.");const bytes=readPayload(stegoImg,lsb($("lsb2").value),$("alpha2").checked);$("recovered").value=await parse(bytes,$("pass2").value);ok($("extractOut"),"Integrity check passed. Message unlocked.")}catch(e){err($("extractOut"),e.message)}};
+</script>
+</body>
+</html>
