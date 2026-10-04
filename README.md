@@ -9,6 +9,7 @@ Features:
 6.Lossless PNG Output: Guarantees pixel-exact preservation of embedded data upon download.
 
 HOW TO USE:
+
 a)Hiding a Message:
 •Open StegoTool.html in any modern browser.
 •Under Hide message, click Choose File and select a cover image.
